@@ -1,0 +1,181 @@
+name: Friday golden-path plan
+
+on:
+  workflow_call:
+    inputs:
+      consumer-intent-path:
+        description: Path to consumer intent in the caller repository
+        required: true
+        type: string
+      subscription-id:
+        description: Existing Azure subscription identifier
+        required: true
+        type: string
+      azure-client-id:
+        description: Federated Azure workload identity client identifier
+        required: true
+        type: string
+      azure-tenant-id:
+        description: Azure tenant identifier
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  GOLDEN_PATH_REPOSITORY: stevenhart235-dev/platform-golden-path
+  GOLDEN_PATH_REF: v0.5.0
+  GOLDEN_PATH_DIRECTORY: _platform/golden-path
+  OUTPUT_DIRECTORY: golden-path-output
+  EFFECTIVE_METADATA_PATH: ${{ github.workspace }}/golden-path-output/effective-metadata.json
+  VALIDATION_RESULT_PATH: ${{ github.workspace }}/golden-path-output/validation-result.json
+  SOURCE_MANIFEST_PATH: ${{ github.workspace }}/golden-path-output/source-manifest.json
+
+jobs:
+  plan:
+    name: Validate and plan
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out consumer repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: consumer
+          persist-credentials: false
+
+      - name: Check out compatible golden-path implementation
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ env.GOLDEN_PATH_REPOSITORY }}
+          ref: ${{ env.GOLDEN_PATH_REF }}
+          path: ${{ env.GOLDEN_PATH_DIRECTORY }}
+          persist-credentials: false
+
+      - name: Resolve consumer intent
+        shell: bash
+        env:
+          CONSUMER_INTENT_PATH: ${{ inputs.consumer-intent-path }}
+        run: |
+          set -euo pipefail
+          consumer_root="$(realpath -- "${GITHUB_WORKSPACE}/consumer")"
+          consumer_file="$(realpath -- "${consumer_root}/${CONSUMER_INTENT_PATH}")"
+          case "${consumer_file}" in
+            "${consumer_root}"/*) ;;
+            *)
+              echo "::error::consumer-intent-path must remain inside the consumer repository"
+              exit 2
+              ;;
+          esac
+          test -f "${consumer_file}"
+          echo "CONSUMER_INTENT_FILE=${consumer_file}" >> "${GITHUB_ENV}"
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12.8"
+          cache: pip
+          cache-dependency-path: ${{ env.GOLDEN_PATH_DIRECTORY }}/requirements-policy.txt
+
+      - name: Install policy dependencies
+        working-directory: ${{ env.GOLDEN_PATH_DIRECTORY }}
+        run: python -m pip install --disable-pip-version-check -r requirements-policy.txt
+
+      - name: Record source versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${OUTPUT_DIRECTORY}"
+          consumer_sha="$(git -C "${GITHUB_WORKSPACE}/consumer" rev-parse HEAD)"
+          golden_path_sha="$(git -C "${GITHUB_WORKSPACE}/${GOLDEN_PATH_DIRECTORY}" rev-parse HEAD)"
+          jq -n \
+            --arg consumer_repository "${GITHUB_REPOSITORY}" \
+            --arg consumer_sha "${consumer_sha}" \
+            --arg workflow_ref "${GITHUB_WORKFLOW_REF}" \
+            --arg golden_path_repository "${GOLDEN_PATH_REPOSITORY}" \
+            --arg golden_path_ref "${GOLDEN_PATH_REF}" \
+            --arg golden_path_sha "${golden_path_sha}" \
+            --arg terraform_version "1.16.2" \
+            '{
+              consumer: {repository: $consumer_repository, sha: $consumer_sha},
+              reusable_workflow: {ref: $workflow_ref},
+              golden_path: {
+                repository: $golden_path_repository,
+                requested_ref: $golden_path_ref,
+                sha: $golden_path_sha
+              },
+              terraform_version: $terraform_version
+            }' > "${SOURCE_MANIFEST_PATH}"
+
+      - name: Normalize effective metadata
+        working-directory: ${{ env.GOLDEN_PATH_DIRECTORY }}
+        run: |
+          python -m policy_validation normalize \
+            --consumer "${CONSUMER_INTENT_FILE}" \
+            --platform config/friday-poc/platform-context.yaml \
+            --contract contracts/tagging/tagging-contract.yaml \
+            --output "${EFFECTIVE_METADATA_PATH}"
+
+      - name: Hash effective metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${OUTPUT_DIRECTORY}"
+          sha256sum effective-metadata.json > effective-metadata.sha256
+
+      - name: Validate governance
+        working-directory: ${{ env.GOLDEN_PATH_DIRECTORY }}
+        run: |
+          python -m policy_validation validate \
+            --input "${EFFECTIVE_METADATA_PATH}" \
+            --contract contracts/tagging/tagging-contract.yaml \
+            --output "${VALIDATION_RESULT_PATH}"
+
+      - name: Verify effective metadata integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${OUTPUT_DIRECTORY}"
+          sha256sum --check effective-metadata.sha256
+          chmod 0444 effective-metadata.json
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: "1.16.2"
+          terraform_wrapper: false
+
+      - name: Initialize Terraform without a backend
+        working-directory: ${{ env.GOLDEN_PATH_DIRECTORY }}/terraform/friday-poc
+        run: terraform init -backend=false -input=false
+
+      - name: Validate Terraform
+        working-directory: ${{ env.GOLDEN_PATH_DIRECTORY }}/terraform/friday-poc
+        run: terraform validate
+
+      - name: Authenticate to Azure with OIDC
+        uses: azure/login@eec3c95657c1536435858eda1f3ff5437fee8474 # v2.3.0
+        with:
+          client-id: ${{ inputs.azure-client-id }}
+          tenant-id: ${{ inputs.azure-tenant-id }}
+          subscription-id: ${{ inputs.subscription-id }}
+
+      - name: Plan Terraform
+        working-directory: ${{ env.GOLDEN_PATH_DIRECTORY }}/terraform/friday-poc
+        env:
+          TF_IN_AUTOMATION: "true"
+        run: |
+          terraform plan \
+            -input=false \
+            -var="effective_metadata_path=${EFFECTIVE_METADATA_PATH}" \
+            -var="subscription_id=${{ inputs.subscription-id }}"
+
+      - name: Upload internal diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: friday-golden-path-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.OUTPUT_DIRECTORY }}
+          if-no-files-found: warn
+          retention-days: 3

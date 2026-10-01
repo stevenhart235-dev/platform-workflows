@@ -171,6 +171,8 @@ jobs:
           terraform init \
             -input=false \
             -reconfigure \
+            -backend-config="use_azuread_auth=true" \
+            -backend-config="use_oidc=true" \
             -backend-config="subscription_id=${TF_BACKEND_SUBSCRIPTION_ID}" \
             -backend-config="resource_group_name=${TF_BACKEND_RESOURCE_GROUP}" \
             -backend-config="storage_account_name=${TF_BACKEND_STORAGE_ACCOUNT}" \

@@ -26,12 +26,17 @@ permissions:
 
 env:
   GOLDEN_PATH_REPOSITORY: stevenhart235-dev/platform-golden-path
-  GOLDEN_PATH_REF: v0.5.0
+  GOLDEN_PATH_REF: v0.6.0
   GOLDEN_PATH_DIRECTORY: _platform/golden-path
   OUTPUT_DIRECTORY: golden-path-output
   EFFECTIVE_METADATA_PATH: ${{ github.workspace }}/golden-path-output/effective-metadata.json
   VALIDATION_RESULT_PATH: ${{ github.workspace }}/golden-path-output/validation-result.json
   SOURCE_MANIFEST_PATH: ${{ github.workspace }}/golden-path-output/source-manifest.json
+  TF_BACKEND_SUBSCRIPTION_ID: 96b5adf1-55d9-4411-ae2a-adfaccecf80e
+  TF_BACKEND_RESOURCE_GROUP: rg-platform-tfstate-centralus
+  TF_BACKEND_STORAGE_ACCOUNT: stplatformtf65b543de
+  TF_BACKEND_CONTAINER: tfstate
+  TF_BACKEND_KEY: friday-poc/azure-application-foundation-v0.tfstate
 
 jobs:
   plan:
@@ -147,20 +152,34 @@ jobs:
           terraform_version: "1.16.2"
           terraform_wrapper: false
 
-      - name: Initialize Terraform without a backend
-        working-directory: ${{ env.GOLDEN_PATH_DIRECTORY }}/terraform/friday-poc
-        run: terraform init -backend=false -input=false
-
-      - name: Validate Terraform
-        working-directory: ${{ env.GOLDEN_PATH_DIRECTORY }}/terraform/friday-poc
-        run: terraform validate
-
       - name: Authenticate to Azure with OIDC
         uses: azure/login@eec3c95657c1536435858eda1f3ff5437fee8474 # v2.3.0
         with:
           client-id: ${{ inputs.azure-client-id }}
           tenant-id: ${{ inputs.azure-tenant-id }}
           subscription-id: ${{ inputs.subscription-id }}
+
+      - name: Initialize Terraform with platform remote state
+        working-directory: ${{ env.GOLDEN_PATH_DIRECTORY }}/terraform/friday-poc
+        env:
+          ARM_USE_OIDC: "true"
+          ARM_USE_AZUREAD: "true"
+          ARM_CLIENT_ID: ${{ inputs.azure-client-id }}
+          ARM_TENANT_ID: ${{ inputs.azure-tenant-id }}
+          ARM_SUBSCRIPTION_ID: ${{ env.TF_BACKEND_SUBSCRIPTION_ID }}
+        run: |
+          terraform init \
+            -input=false \
+            -reconfigure \
+            -backend-config="subscription_id=${TF_BACKEND_SUBSCRIPTION_ID}" \
+            -backend-config="resource_group_name=${TF_BACKEND_RESOURCE_GROUP}" \
+            -backend-config="storage_account_name=${TF_BACKEND_STORAGE_ACCOUNT}" \
+            -backend-config="container_name=${TF_BACKEND_CONTAINER}" \
+            -backend-config="key=${TF_BACKEND_KEY}"
+
+      - name: Validate Terraform
+        working-directory: ${{ env.GOLDEN_PATH_DIRECTORY }}/terraform/friday-poc
+        run: terraform validate
 
       - name: Plan Terraform
         working-directory: ${{ env.GOLDEN_PATH_DIRECTORY }}/terraform/friday-poc
